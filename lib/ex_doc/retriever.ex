@@ -9,13 +9,14 @@ defmodule ExDoc.Retriever do
 
   alias ExDoc.{DocAST, GroupMatcher, Refs}
   alias ExDoc.Retriever.Error
+  alias ExDoc.Language.Elixir, as: Language
 
   @doc """
   Extract documentation from all modules in the specified directory or directories.
   """
   @spec docs_from_dir(Path.t() | [Path.t()], ExDoc.Config.t()) :: [ExDoc.ModuleNode.t()]
   def docs_from_dir(dir, config) when is_binary(dir) do
-    pattern = if config.filter_prefix, do: "Elixir.#{config.filter_prefix}*.beam", else: "*.beam"
+    pattern = Language.filter_prefix_pattern(config.filter_prefix)
     files = Path.wildcard(Path.expand(pattern, dir))
     docs_from_files(files, config)
   end
@@ -57,10 +58,15 @@ defmodule ExDoc.Retriever do
   # the module is not available or it was not compiled
   # with --docs flag), we raise an exception.
   defp get_module(module, config) do
-    if docs_chunk = docs_chunk(module) do
-      generate_node(module, docs_chunk, config)
-    else
-      []
+    cond do
+      Language.skip_module?(module) ->
+        []
+
+      docs_chunk = docs_chunk(module) ->
+        generate_node(module, docs_chunk, config)
+
+      true ->
+        []
     end
   end
 
@@ -72,10 +78,6 @@ defmodule ExDoc.Retriever do
       prefix -> {String.trim_leading(title, prefix <> "."), prefix}
     end
   end
-
-  # Special case required for Elixir
-  defp docs_chunk(:elixir_bootstrap), do: false
-  defp docs_chunk(Elixir), do: false
 
   defp docs_chunk(module) do
     result = ExDoc.Utils.Code.fetch_docs(module)
@@ -111,9 +113,10 @@ defmodule ExDoc.Retriever do
   defp generate_node(module, docs_chunk, config) do
     module_data = get_module_data(module, docs_chunk)
 
-    case module_data do
-      %{type: :impl} -> []
-      _ -> [do_generate_node(module, module_data, config)]
+    if Language.skip_module_type?(module_data.type) do
+      []
+    else
+      [do_generate_node(module, module_data, config)]
     end
   end
 
@@ -128,7 +131,7 @@ defmodule ExDoc.Retriever do
     {function_groups, function_docs} = get_docs(module_data, source, config)
     docs = function_docs ++ get_callbacks(module_data, source)
     types = get_types(module_data, source)
-    {title, id} = module_title_and_id(module_data)
+    {title, id} = Language.module_title_and_id(module_data.name, module_data.type)
     {nested_title, nested_context} = nesting_info(title, config.nest_modules_by_prefix)
 
     node = %ExDoc.ModuleNode{
@@ -167,36 +170,13 @@ defmodule ExDoc.Retriever do
   defp get_module_data(module, docs_chunk) do
     %{
       name: module,
-      type: get_type(module),
+      type: Language.module_type(module),
       specs: get_specs(module),
       impls: get_impls(module),
       callbacks: get_callbacks(module),
       abst_code: get_abstract_code(module),
       docs: docs_chunk
     }
-  end
-
-  defp get_type(module) do
-    cond do
-      function_exported?(module, :__struct__, 0) and
-          match?(%{__exception__: true}, module.__struct__) ->
-        :exception
-
-      function_exported?(module, :__protocol__, 1) ->
-        :protocol
-
-      function_exported?(module, :__impl__, 1) ->
-        :impl
-
-      function_exported?(module, :behaviour_info, 1) ->
-        :behaviour
-
-      match?("Elixir.Mix.Tasks." <> _, Atom.to_string(module)) ->
-        :task
-
-      true ->
-        :module
-    end
   end
 
   defp get_module_docs(module_data, source_path) do
@@ -263,32 +243,16 @@ defmodule ExDoc.Retriever do
   defp get_function(function, source, module_data, groups_for_functions) do
     {:docs_v1, _, _, content_type, _, _, _} = module_data.docs
     {{type, name, arity}, anno, signature, doc, metadata} = function
-    actual_def = actual_def(name, arity, type)
-    doc_line = anno_line(anno)
-    annotations = annotations_from_metadata(metadata)
-
-    line = find_function_line(module_data, actual_def) || doc_line
-    impl = Map.fetch(module_data.impls, actual_def)
     defaults = get_defaults(name, arity, Map.get(metadata, :defaults, 0))
 
-    specs =
-      module_data.specs
-      |> Map.get(actual_def, [])
-      |> Enum.map(&Code.Typespec.spec_to_quoted(name, &1))
+    actual_def = Language.actual_def(type, name, arity)
+    specs = Language.normalize_specs(module_data.specs, type, name, arity)
+    annotations = annotations_from_metadata(metadata)
+    annotations = Language.extra_annotations(type, name, arity) ++ annotations
 
-    specs =
-      if type == :macro do
-        Enum.map(specs, &remove_first_macro_arg/1)
-      else
-        specs
-      end
-
-    annotations =
-      case {type, name, arity} do
-        {:macro, _, _} -> ["macro" | annotations]
-        {_, :__struct__, 0} -> ["struct" | annotations]
-        _ -> annotations
-      end
+    doc_line = anno_line(anno)
+    line = find_function_line(module_data, actual_def) || doc_line
+    impl = Map.fetch(module_data.impls, actual_def)
 
     group =
       Enum.find_value(groups_for_functions, fn {group, filter} ->
@@ -299,8 +263,7 @@ defmodule ExDoc.Retriever do
 
     doc_ast =
       (doc && doc_ast(content_type, doc, file: source.path, line: doc_line + 1)) ||
-        callback_doc_ast(name, arity, impl) ||
-        delegate_doc_ast(metadata[:delegate_to])
+        Language.doc_fallback(name, arity, impl, metadata)
 
     %ExDoc.FunctionNode{
       id: "#{name}/#{arity}",
@@ -318,32 +281,6 @@ defmodule ExDoc.Retriever do
       group: group,
       annotations: annotations
     }
-  end
-
-  defp delegate_doc_ast({m, f, a}) do
-    [
-      {:p, [], ["See ", {:code, [class: "inline"], [Exception.format_mfa(m, f, a)], %{}}, "."],
-       %{}}
-    ]
-  end
-
-  defp delegate_doc_ast(nil) do
-    nil
-  end
-
-  defp callback_doc_ast(name, arity, {:ok, behaviour}) do
-    [
-      {:p, [],
-       [
-         "Callback implementation for ",
-         {:code, [class: "inline"], ["c:#{inspect(behaviour)}.#{name}/#{arity}"], %{}},
-         "."
-       ], %{}}
-    ]
-  end
-
-  defp callback_doc_ast(_, _, _) do
-    nil
   end
 
   defp get_defaults(_name, _arity, 0), do: []
@@ -380,9 +317,9 @@ defmodule ExDoc.Retriever do
   defp get_callback(callback, source, optional_callbacks, module_data) do
     {:docs_v1, _, _, content_type, _, _, _} = module_data.docs
     {{kind, name, arity}, anno, signature, doc, metadata} = callback
-    actual_def = actual_def(name, arity, kind)
-    doc_line = anno_line(anno)
     signature = signature(signature)
+    actual_def = Language.actual_def(kind, name, arity)
+    doc_line = anno_line(anno)
 
     {specs, line, signature} =
       case Map.fetch(module_data.callbacks, actual_def) do
@@ -544,16 +481,6 @@ defmodule ExDoc.Retriever do
   defp signature([]), do: nil
   defp signature(list) when is_list(list), do: Enum.join(list, " ")
 
-  defp actual_def(name, arity, :macrocallback) do
-    {String.to_atom("MACRO-" <> to_string(name)), arity + 1}
-  end
-
-  defp actual_def(name, arity, :macro) do
-    {String.to_atom("MACRO-" <> to_string(name)), arity + 1}
-  end
-
-  defp actual_def(name, arity, _), do: {name, arity}
-
   defp annotations_from_metadata(metadata) do
     annotations = []
 
@@ -565,14 +492,6 @@ defmodule ExDoc.Retriever do
       end
 
     annotations
-  end
-
-  defp remove_first_macro_arg({:"::", info, [{name, info2, [_term_arg | rest_args]}, return]}) do
-    {:"::", info, [{name, info2, rest_args}, return]}
-  end
-
-  defp remove_first_macro_arg({:when, meta, [lhs, rhs]}) do
-    {:when, meta, [remove_first_macro_arg(lhs), rhs]}
   end
 
   defp find_module_line(%{abst_code: abst_code, name: name}) do
@@ -607,29 +526,5 @@ defmodule ExDoc.Retriever do
     else
       source
     end
-  end
-
-  defp module_title_and_id(%{name: module, type: :task}) do
-    {"mix " <> task_name(module), module_id(module)}
-  end
-
-  defp module_title_and_id(%{name: module}) do
-    id = module_id(module)
-    {id, id}
-  end
-
-  defp module_id(module) do
-    case inspect(module) do
-      ":" <> inspected -> inspected
-      inspected -> inspected
-    end
-  end
-
-  defp task_name(module) do
-    "Elixir.Mix.Tasks." <> name = Atom.to_string(module)
-
-    name
-    |> String.split(".")
-    |> Enum.map_join(".", &Macro.underscore/1)
   end
 end
