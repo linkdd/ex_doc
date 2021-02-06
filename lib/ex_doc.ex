@@ -85,8 +85,9 @@ defmodule ExDoc do
     String.trim_trailing(output, "/")
   end
 
-  defp normalize_proglang(elixir) when elixir in [:elixir, "elixir"], do: :elixir
-  defp normalize_proglang(erlang) when erlang in [:erlang, "erlang"], do: :erlang
+  defp normalize_proglang(string) do
+    String.to_atom(string)
+  end
 
   defp normalize_groups_for_modules(groups_for_modules) do
     default_groups = [Deprecated: &deprecated?/1, Exceptions: &exception?/1]
