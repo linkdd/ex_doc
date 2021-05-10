@@ -74,6 +74,17 @@ defmodule ExDoc.Language.Elixir do
     }
   end
 
+  @impl true
+  def type_data(entry, spec, _module_data) do
+    {{_kind, _name, arity}, _anno, _signature, _doc, _metadata} = entry
+
+    %{
+      signature_fallback: fn ->
+        get_typespec_signature(spec, arity)
+      end
+    }
+  end
+
   ## Helpers
 
   defp module_type_and_skip(module) do
